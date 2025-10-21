@@ -1,0 +1,321 @@
+import os
+import numpy as np
+import random
+import tensorflow as tf
+import pickle
+import streamlit as st
+from PIL import Image
+from sklearn.neighbors import NearestNeighbors
+from tensorflow.keras.models import Model, load_model # type: ignore
+from tensorflow.keras.layers import Input, Dense, GlobalAveragePooling2D, Lambda, Concatenate # type: ignore
+from tensorflow.keras.utils import Sequence # type: ignore
+from tensorflow.keras.preprocessing.image import load_img, img_to_array  # type: ignore
+from tensorflow.keras.applications import ResNet50 # type: ignore
+from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint # type: ignore
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+TRIPLET_MARGIN = 0.2
+TARGET_SHAPE = (224, 224)
+EMBEDDING_DIM = 128
+K_NEIGHBORS = 5
+BATCH_SIZE = 32
+MODEL_PATH = 'final_image_embedding_nn.h5'
+INDEX_PATH = 'final_nn_index.pkl'
+PATHS_MAP_PATH = 'master_image_paths.npy'
+BEST_WEIGHTS_PATH = 'best_triplet_weights.weights.h5'
+DATA_ROOT = r"C:\ImageDataSet\OIDv4_ToolKit\OID\Dataset"
+BASE_TRAIN_DIR = os.path.join(DATA_ROOT, 'train')
+BASE_VAL_DIR = os.path.join(DATA_ROOT, 'validation')
+BASE_TEST_DIR = os.path.join(DATA_ROOT, 'test')
+
+def load_image_for_model(image_path_or_bytes):
+    """Preprocesses a single image for model input."""
+    # This function is used by the simple generator and the demo logic
+    if isinstance(image_path_or_bytes, (str, os.PathLike)):
+        # Load from path (for generator)
+        img = load_img(image_path_or_bytes, target_size=TARGET_SHAPE)
+    else:
+        # Load from uploaded file bytes (for Streamlit demo)
+        img = Image.open(image_path_or_bytes).convert('RGB').resize(TARGET_SHAPE)
+        
+    img_array = img_to_array(img) / 255.0
+    # Add batch dimension (1, 224, 224, 3)
+    return np.expand_dims(img_array, axis=0)
+
+def create_triplet_list(base_dir, num_triplets):
+    """Indexes images by class and randomly generates Anchor, Positive, and Negative triplets."""
+    all_classes = {}
+    for class_name in os.listdir(base_dir):
+        class_path = os.path.join(base_dir, class_name)
+        if os.path.isdir(class_path):
+            image_files = [
+                os.path.join(class_path, img) for img in os.listdir(class_path)
+                if img.lower().endswith(('.jpg', '.jpeg', '.png'))
+            ]
+            all_classes[class_name] = image_files
+    triplets = []
+    class_names = [c for c in all_classes.keys() if len(all_classes[c]) >= 2]
+    for _ in range(num_triplets):
+        if not class_names:
+            print("Warning: No classes with >= 2 images found. Stopping mining.")
+            break
+        anchor_class = random.choice(class_names)
+        anchor_path, positive_path = random.sample(all_classes[anchor_class], 2)
+        other_classes = [c for c in class_names if c != anchor_class]
+        if not other_classes: continue
+        negative_class = random.choice(other_classes)
+        negative_path = random.choice(all_classes[negative_class])
+        triplets.append((anchor_path, positive_path, negative_path))
+    return triplets
+
+class TripletGenerator(Sequence):
+    """Custom Keras Sequence to load (Anchor, Positive, Negative) image triplets."""
+    def __init__(self, triplet_list, batch_size=BATCH_SIZE, img_size=TARGET_SHAPE, shuffle=True):
+        self.triplet_list = triplet_list
+        self.batch_size = batch_size
+        self.img_size = img_size
+        self.shuffle = shuffle
+        self.on_epoch_end()
+
+    def __len__(self):
+        return int(np.floor(len(self.triplet_list) / self.batch_size))
+
+    def on_epoch_end(self):
+        self.indexes = np.arange(len(self.triplet_list))
+        if self.shuffle:
+            np.random.shuffle(self.indexes)
+
+    def load_image(self, img_path):
+        """Loads, resizes, and handles errors for a single image."""
+        try:
+            img = load_img(img_path, target_size=self.img_size)
+            img_array = img_to_array(img)
+            return img_array / 255.0
+        except Exception:
+            # Return a black array for corrupted/missing files 
+            return np.zeros((*self.img_size, 3), dtype='float32')
+
+    def __getitem__(self, index):
+        """Generates one batch of data."""
+        start_idx = index * self.batch_size
+        end_idx = (index + 1) * self.batch_size
+        batch_indexes = self.indexes[start_idx:end_idx]
+        X_anchor = np.empty((self.batch_size, *self.img_size, 3), dtype='float32')
+        X_positive = np.empty((self.batch_size, *self.img_size, 3), dtype='float32')
+        X_negative = np.empty((self.batch_size, *self.img_size, 3), dtype='float32')
+        for i, list_index in enumerate(batch_indexes):
+            anchor_path, positive_path, negative_path = self.triplet_list[list_index]
+            X_anchor[i,] = self.load_image(anchor_path)
+            X_positive[i,] = self.load_image(positive_path)
+            X_negative[i,] = self.load_image(negative_path)
+        dummy_output = np.zeros((self.batch_size, 1), dtype='float32')
+        return (X_anchor, X_positive, X_negative), dummy_output
+
+class L2NormalizationLayer(tf.keras.layers.Layer):
+    """Performs L2 normalization on the tensor. Serializable."""
+    def call(self, x):
+        return tf.math.l2_normalize(x, axis=1)
+    def get_config(self):
+        return super().get_config()
+
+def triplet_loss(y_true, y_pred, margin=TRIPLET_MARGIN):
+    """Calculates the Triplet Loss."""
+    anchor, positive, negative = tf.split(y_pred, num_or_size_splits=3, axis=1)
+    pos_dist = tf.reduce_sum(tf.square(anchor - positive), axis=1)
+    neg_dist = tf.reduce_sum(tf.square(anchor - negative), axis=1)
+    loss = tf.maximum(pos_dist - neg_dist + margin, 0.0)
+    return tf.reduce_mean(loss)
+
+def output_shape_for_l2(input_shape):
+    """Returns the output shape (maintains the batch size and embedding dimension)."""
+    return (input_shape[-1],)
+
+def get_embedding_network(input_shape=TARGET_SHAPE + (3,)):
+    """Defines the ResNet50 backbone and the L2-normalized dense embedding head."""
+    base_model = tf.keras.applications.ResNet50(weights='imagenet', include_top=False, input_shape=input_shape)
+    for layer in base_model.layers:
+        layer.trainable = False
+    x = base_model.output
+    x = tf.keras.layers.GlobalAveragePooling2D()(x)
+    x = tf.keras.layers.Dense(EMBEDDING_DIM)(x)
+    output = L2NormalizationLayer(name="embedding_norm")(x)
+    return Model(inputs=base_model.input, outputs=output)
+
+def get_triplet_model(embedding_model):
+    """Creates the Siamese-like model for training with 3 inputs."""
+    anchor_input = Input(shape=TARGET_SHAPE + (3,), name="anchor_input")
+    positive_input = Input(shape=TARGET_SHAPE + (3,), name="positive_input")
+    negative_input = Input(shape=TARGET_SHAPE + (3,), name="negative_input")
+    anchor_embedding = embedding_model(anchor_input)
+    positive_embedding = embedding_model(positive_input)
+    negative_embedding = embedding_model(negative_input)
+    concat_layer = Concatenate(axis=1)
+    concatenated_output = concat_layer([anchor_embedding, positive_embedding, negative_embedding])
+    triplet_model = Model(inputs=[anchor_input, positive_input, negative_input], outputs=concatenated_output)
+    return triplet_model
+
+def run_training_and_save(triplet_train_model, embedding_nn, train_generator, val_generator):
+    """Compiles the model, runs fitting with callbacks, and saves the final embedding model."""
+    callbacks = [
+        tf.keras.callbacks.ModelCheckpoint(
+            filepath=BEST_WEIGHTS_PATH,
+            save_weights_only=True,
+            monitor='val_loss',
+            mode='min',
+            save_best_only=True,
+            verbose=1
+        ),
+        tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=5, mode='min', verbose=1)
+    ]
+    triplet_train_model.compile(optimizer='adam', loss=triplet_loss)
+    print("\nStarting Triplet Loss Training...")
+    triplet_train_model.fit(
+        train_generator,
+        epochs=50,
+        validation_data=val_generator,
+        callbacks=callbacks
+    )
+    triplet_train_model.load_weights(BEST_WEIGHTS_PATH)
+    embedding_nn.save(MODEL_PATH)
+    print(f"\nTraining complete. Final model saved to {MODEL_PATH}")
+
+def index_all_data(base_dirs):
+    """Creates a single master list of all image paths and labels across all splits."""
+    all_paths = []
+    all_labels = []
+    all_class_names = []
+    for base_dir in base_dirs:
+        class_names_in_dir = [name for name in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, name))]
+        all_class_names.extend(class_names_in_dir)
+    unique_class_names = sorted(list(set(all_class_names)))
+    class_to_id = {name: i for i, name in enumerate(unique_class_names)}
+    for base_dir in base_dirs:
+        for class_name in os.listdir(base_dir):
+            class_path = os.path.join(base_dir, class_name)
+            if os.path.isdir(class_path) and class_name in class_to_id:
+                class_id = class_to_id[class_name]
+                for img_file in os.listdir(class_path):
+                    if img_file.lower().endswith(('.jpg', '.jpeg', '.png')):
+                        all_paths.append(os.path.join(class_path, img_file))
+                        all_labels.append(class_id)
+    print(f"Total Images Indexed: {len(all_paths)}")
+    return all_paths, np.array(all_labels)
+
+def get_simple_image_generator(paths, img_size):
+    """Simple generator to feed individual images for prediction."""
+    for path in paths:
+        yield (load_image_for_model(path),) 
+
+def generate_and_save_embeddings(embedding_model, all_paths, img_size):
+    """Feeds all images through the trained CNN to get feature vectors."""
+    print("\nStarting feature extraction for all images...")
+    full_data_generator = get_simple_image_generator(all_paths, img_size)
+    image_embeddings = embedding_model.predict(
+        full_data_generator,
+        steps=len(all_paths),
+        verbose=1
+    )
+    print(f"Feature Database created with shape: {image_embeddings.shape}")
+    np.save('master_image_embeddings.npy', image_embeddings)
+    np.save(PATHS_MAP_PATH, np.array(all_paths))
+    return image_embeddings
+
+def create_and_save_index(image_embeddings):
+    """Fits the K-NN model to the embeddings and saves the searchable index."""
+    nn_model = NearestNeighbors(n_neighbors=K_NEIGHBORS + 1, metric='cosine') 
+    nn_model.fit(image_embeddings)
+    try:
+        with open(INDEX_PATH, 'wb') as f:
+            pickle.dump(nn_model, f)
+        print("K-NN Search Index saved to 'final_nn_index.pkl'")
+    except Exception as e:
+        print(f"ERROR: Could not save K-NN index: {e}")
+
+@st.cache_resource
+def load_deployment_assets():
+    """Loads the trained model, K-NN index, and file paths once."""
+    try:
+        model = load_model(
+            MODEL_PATH,
+            compile=False,
+            custom_objects={'L2NormalizationLayer': L2NormalizationLayer} # <-- PASSING THE CLASS
+        )
+        with open(INDEX_PATH, 'rb') as f:
+            nn_index = pickle.load(f)
+        paths_map = np.load(PATHS_MAP_PATH, allow_pickle=True)
+        return model, nn_index, paths_map
+    except FileNotFoundError:
+        st.error(f"FATAL ERROR: Deployment files missing.")
+        st.caption(f"Ensure the following files exist after running indexing: {MODEL_PATH}, {INDEX_PATH}, {PATHS_MAP_PATH}")
+        return None, None, None
+    except Exception as e:
+        st.error(f"Error loading assets: {e}")
+        return None, None, None
+
+def recommend_images(query_image_file, embedding_model, nn_model, all_paths, k=K_NEIGHBORS):
+    """Runs the full search pipeline on a query image."""
+    query_array = load_image_for_model(query_image_file)
+    query_embedding = embedding_model.predict(query_array, verbose=0)
+    distances, indices = nn_model.kneighbors(query_embedding, n_neighbors=k + 1)
+    recommended_indices = indices[0][1:]
+    recommended_paths = all_paths[recommended_indices]
+    recommended_distances = distances[0][1:]
+    return recommended_paths, recommended_distances
+
+def main():
+    st.set_page_config(layout="wide", page_title="Image Similarity Recommender Demo")
+    st.title("Deep Learning Image Recommendation System")
+    st.markdown("---")
+    st.caption("Architecture: ResNet50 + Triplet Loss Embeddings + K-NN Search Index")
+    embedding_model, nn_model, all_paths = load_deployment_assets()
+    if embedding_model is None:
+        st.stop()
+    #INPUT SECTION
+    st.subheader("1. Upload Query Image")
+    uploaded_file = st.file_uploader("Choose an Image to find similar items:", type=["jpg", "jpeg", "png"])
+    if uploaded_file is not None:
+        col1, col2 = st.columns([1, 2])
+        with col1:
+            st.image(uploaded_file, caption='Query Image (Anchor)', use_column_width=True)
+            if st.button(f"Find Top {K_NEIGHBORS} Similar Items", use_container_width=True):
+                with col2:
+                    st.subheader(f"2. Top {K_NEIGHBORS} Recommendations Found:")
+                    recommended_paths, recommended_distances = recommend_images(
+                        uploaded_file, embedding_model, nn_model, all_paths, k=K_NEIGHBORS
+                    )
+                    result_cols = st.columns(K_NEIGHBORS)
+                    for i, path in enumerate(recommended_paths):
+                        try:
+                            recommended_img = Image.open(path)
+                            class_name = os.path.basename(os.path.dirname(path))
+                            with result_cols[i]:
+                                st.image(recommended_img, use_column_width=True)
+                                st.caption(f"**Rank {i+1}** | Class: {class_name}")
+                                st.markdown(f"<p style='font-size:12px; color: grey;'>Distance: {recommended_distances[i]:.4f}</p>", unsafe_allow_html=True)
+                        except FileNotFoundError:
+                            st.warning(f"Image file not found on disk: {os.path.basename(path)}")
+
+if __name__ == '__main__':
+    embedding_nn = get_embedding_network()
+    triplet_train_model = get_triplet_model(embedding_nn)
+    NUM_TRAIN = 700; NUM_VAL = 150; 
+    print("\n--- Generating Triplet Lists ---")
+    train_triplets = create_triplet_list(BASE_TRAIN_DIR, num_triplets=NUM_TRAIN)
+    val_triplets = create_triplet_list(BASE_VAL_DIR, num_triplets=NUM_VAL)
+    if len(train_triplets) < 10 or len(val_triplets) < 10:
+        print(f"FATAL: Insufficient data for training. Found {len(train_triplets)} train triplets.")
+        exit()
+    train_generator = TripletGenerator(train_triplets, batch_size=BATCH_SIZE, shuffle=True)
+    val_generator = TripletGenerator(val_triplets, batch_size=BATCH_SIZE, shuffle=False)
+    run_training_and_save(triplet_train_model, embedding_nn, train_generator, val_generator)
+    print("\n--- Starting Final Indexing Stage ---")
+    base_dirs_all = [BASE_TRAIN_DIR, BASE_VAL_DIR, BASE_TEST_DIR]
+    all_paths, all_labels = index_all_data(base_dirs_all)
+    final_embeddings = generate_and_save_embeddings(embedding_nn, all_paths, TARGET_SHAPE)
+    create_and_save_index(final_embeddings)
+    print("\n----------------------------------------------------")
+    print("SETUP COMPLETE! Run 'streamlit run app.py' again to launch the demo.")
+    print("----------------------------------------------------")
+    # To run the Streamlit demo, replace the code above with just 'main()'
+    # main()
