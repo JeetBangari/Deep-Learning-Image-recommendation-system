@@ -80,6 +80,41 @@ def index_test_data(base_dir):
                     all_labels.append(class_id)
                     
     return all_paths, np.array(all_labels)
+embedding_model = load_model(MODEL_PATH, compile=False)
+
+def run_training_and_save(triplet_train_model, embedding_nn, train_generator, val_generator):
+    checkpoint_filepath = 'best_triplet_weights.h5'
+    callbacks = [
+        ModelCheckpoint(
+            filepath=checkpoint_filepath,
+            save_weights_only=True,
+            monitor='val_loss',
+            mode='min',
+            save_best_only=True,
+            verbose=1
+        ),
+        EarlyStopping(monitor='val_loss', patience=5, mode='min', verbose=1)
+    ]
+    triplet_train_model.compile(optimizer='adam', loss=triplet_loss)
+    print("\nStarting Triplet Loss Training...")
+    triplet_train_model.fit(
+        train_generator,
+        epochs=50,
+        validation_data=val_generator,
+        callbacks=callbacks
+    )
+    embedding_nn.load_weights(checkpoint_filepath)
+    embedding_nn.save(MODEL_PATH)
+    print(f"\n✅ Training complete. Final model saved to {MODEL_PATH}")
+
+def get_simple_image_generator(paths, img_size):
+    """Simple generator to feed individual images for prediction."""
+    def preprocess(path):
+        img = load_img(path, target_size=img_size)
+        img_array = img_to_array(img) / 255.0
+        return img_array
+    for path in paths:
+        yield np.expand_dims(preprocess(path), axis=0)
 
 def calculate_recall_at_k(embedding_model, test_paths, test_labels, k):
     """
