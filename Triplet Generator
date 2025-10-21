@@ -1,0 +1,63 @@
+import os
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+
+import tensorflow as tf
+from tensorflow.keras.utils import Sequence # type: ignore
+from tensorflow.keras.preprocessing.image import load_img, img_to_array # type: ignore
+import numpy as np
+import os
+
+# --- Constants ---
+TARGET_SHAPE = (224, 224)
+BATCH_SIZE = 32
+
+#This class will help in generating our (A,P,N)tuple triplet for triplet loss approach.
+class TripletGenerator(Sequence):
+    """
+    Custom Keras Sequence to load (Anchor, Positive, Negative) image triplets.
+    """
+    def __init__(self, triplet_list, batch_size=BATCH_SIZE, img_size=TARGET_SHAPE, shuffle=True):
+        self.triplet_list = triplet_list
+        self.batch_size = batch_size
+        self.img_size = img_size
+        self.shuffle = shuffle
+        self.on_epoch_end() # Initialize indices the method is specifically responsible for ensuring the data order is randomized for the next training cycle.
+
+    def __len__(self):
+        # Number of batches per epoch
+        return int(np.floor(len(self.triplet_list) / self.batch_size))
+
+    def on_epoch_end(self):
+        # Updates indexes after each epoch (shuffling for next epoch)
+        self.indexes = np.arange(len(self.triplet_list))
+        if self.shuffle == True:
+            np.random.shuffle(self.indexes)
+
+    def load_image(self, img_path):
+        """Loads, resizes, and normalizes a single image."""
+        img = load_img(img_path, target_size=self.img_size)
+        img_array = img_to_array(img)
+        # Rescale pixel values to [0, 1] (or use ResNet's preprocess_input)
+        return img_array / 255.0
+
+    def __getitem__(self, index):
+        """Generates one batch of data."""
+        # Get batch indices batch sizeis 32
+        start_idx = index * self.batch_size
+        end_idx = (index + 1) * self.batch_size
+        batch_indexes = self.indexes[start_idx:end_idx]
+        # Initialize arrays for the batch
+        X_anchor = np.empty((self.batch_size, *self.img_size, 3), dtype='float32')
+        X_positive = np.empty((self.batch_size, *self.img_size, 3), dtype='float32')
+        X_negative = np.empty((self.batch_size, *self.img_size, 3), dtype='float32')
+        for i, list_index in enumerate(batch_indexes):
+            anchor_path, positive_path, negative_path = self.triplet_list[list_index]
+            # Load the three images
+            X_anchor[i,] = self.load_image(anchor_path)
+            X_positive[i,] = self.load_image(positive_path)
+            X_negative[i,] = self.load_image(negative_path)
+        # The model requires three inputs (A, P, N) and a dummy output (y)
+        # because the loss is calculated internally based on the inputs.
+        # Use a dummy output of zeros.
+        dummy_output = np.zeros((self.batch_size, 1), dtype='float32')
+        return [X_anchor, X_positive, X_negative], dummy_output
