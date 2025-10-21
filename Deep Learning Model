@@ -8,85 +8,51 @@ from tensorflow.keras.layers import Input, Dense, GlobalAveragePooling2D, Lambda
 from tensorflow.keras.utils import Sequence
 from tensorflow.keras.preprocessing.image import load_img, img_to_array
 def triplet_loss(y_true, y_pred, margin=TRIPLET_MARGIN):
-    """
-    Calculates the Triplet Loss: L = max(0, d(A,P) - d(A,N) + margin)
-    Note: y_pred contains the concatenated embeddings [E_A, E_P, E_N]
-    """
-    # 1. Split the concatenated embeddings
-    # Assume the concatenated embeddings are [Anchor, Positive, Negative]
     anchor, positive, negative = tf.split(y_pred, num_or_size_splits=3, axis=1)
-    # 2. Calculate distances (Squared Euclidean distance is simplest for Keras)
     pos_dist = tf.reduce_sum(tf.square(anchor - positive), axis=1)
     neg_dist = tf.reduce_sum(tf.square(anchor - negative), axis=1)
-    # 3. Calculate the loss: max(0, pos_dist - neg_dist + margin)
     loss = tf.maximum(pos_dist - neg_dist + margin, 0.0)
-    # Return the mean loss across the batch
     return tf.reduce_mean(loss)
 
-# Define the single Embedding Network (Backbone + Head)
 def get_embedding_network(input_shape=TARGET_SHAPE + (3,)):
-    # Load ResNet50 pre-trained on ImageNet
     base_model = ResNet50(weights='imagenet', include_top=False, input_shape=input_shape)
-    # --- Freezing Strategy ---
-    # Freeze the weights of the base CNN to preserve ImageNet features
     base_model.trainable = False
-    # --- Adding the Embedding Head (The layers that will be trained) ---
     x = base_model.output
-    x = GlobalAveragePooling2D()(x) # Reduces spatial dimensions
-    # The final dense embedding layer
+    x = GlobalAveragePooling2D()(x)
     x = Dense(EMBEDDING_DIM)(x)
-    # L2 Normalization (Crucial for similarity metric learning)
     output = Lambda(lambda x: tf.math.l2_normalize(x, axis=1), name="embedding")(x)
     return Model(inputs=base_model.input, outputs=output)
 
-# Define the full Siamese-like Triplet Model
 def get_triplet_model(embedding_model):
-    # 1. Define the three inputs
     anchor_input = Input(shape=TARGET_SHAPE + (3,), name="anchor_input")
     positive_input = Input(shape=TARGET_SHAPE + (3,), name="positive_input")
     negative_input = Input(shape=TARGET_SHAPE + (3,), name="negative_input")
-    # 2. Process each input using the SAME weight-sharing embedding model
     anchor_embedding = embedding_model(anchor_input)
     positive_embedding = embedding_model(positive_input)
     negative_embedding = embedding_model(negative_input)
-    # 3. Concatenate the three outputs for loss calculation
     concatenated_output = tf.concat([anchor_embedding, positive_embedding, negative_embedding], axis=1)
-    # The Triplet model receives three inputs and outputs the concatenated embeddings
-    # The loss function will interpret this concatenated vector.
-    triplet_model = Model(inputs=[anchor_input, positive_input, negative_input],outputs=concatenated_output)
-    return
-print("1. Defining Embedding Network...")
-embedding_nn = get_embedding_network()
-print("2. Defining Triplet Training Model...")
-triplet_train_model = get_triplet_model(embedding_nn)
-K_NEIGHBORS = 5
-MODEL_PATH = 'final_image_embedding_nn.h5'
+    triplet_model = Model(inputs=[anchor_input, positive_input, negative_input], outputs=concatenated_output)
+    return triplet_model
 
 def index_test_data(base_dir):
-    """
-    Creates a list of all file paths and a list of their corresponding class labels.
-    This is necessary to check if a retrieved neighbor is 'correct'.
-    """
+    """Indexes file paths and maps class names to integer labels."""
     all_paths = []
     all_labels = []
-    # Map class names to integer IDs (0, 1, 2, ...) for easy comparison
-    class_to_id = {name: i for i, name in enumerate(os.listdir(base_dir))}
+    class_names = [name for name in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, name))]
+    class_to_id = {name: i for i, name in enumerate(class_names)}
     for class_name, class_id in class_to_id.items():
         class_path = os.path.join(base_dir, class_name)
-        if os.path.isdir(class_path):
-            for img_file in os.listdir(class_path):
-                if img_file.endswith(('.jpg', '.jpeg', '.png')):
-                    all_paths.append(os.path.join(class_path, img_file))
-                    all_labels.append(class_id)
-                    
+        for img_file in os.listdir(class_path):
+            if img_file.endswith(('.jpg', '.jpeg', '.png')):
+                all_paths.append(os.path.join(class_path, img_file))
+                all_labels.append(class_id)
     return all_paths, np.array(all_labels)
-embedding_model = load_model(MODEL_PATH, compile=False)
 
 def run_training_and_save(triplet_train_model, embedding_nn, train_generator, val_generator):
-    checkpoint_filepath = 'best_triplet_weights.h5'
+    """Compiles the model, runs fitting with callbacks, and saves the final embedding model."""
     callbacks = [
         ModelCheckpoint(
-            filepath=checkpoint_filepath,
+            filepath=BEST_WEIGHTS_PATH,
             save_weights_only=True,
             monitor='val_loss',
             mode='min',
@@ -95,41 +61,52 @@ def run_training_and_save(triplet_train_model, embedding_nn, train_generator, va
         ),
         EarlyStopping(monitor='val_loss', patience=5, mode='min', verbose=1)
     ]
+    
     triplet_train_model.compile(optimizer='adam', loss=triplet_loss)
     print("\nStarting Triplet Loss Training...")
+    #TRAINING EXECUTION
     triplet_train_model.fit(
         train_generator,
         epochs=50,
         validation_data=val_generator,
         callbacks=callbacks
     )
-    embedding_nn.load_weights(checkpoint_filepath)
+    # Load the best weights into the single embedding network (for feature extraction)
+    embedding_nn.load_weights(BEST_WEIGHTS_PATH)
     embedding_nn.save(MODEL_PATH)
-    print(f"\n✅ Training complete. Final model saved to {MODEL_PATH}")
-
+    print(f"\n Training complete. Final embedding model saved to {MODEL_PATH}")
+# Simple Generator for individual image prediction (for embedding generation)
 def get_simple_image_generator(paths, img_size):
     """Simple generator to feed individual images for prediction."""
     def preprocess(path):
+        # Using Keras loading utility
         img = load_img(path, target_size=img_size)
         img_array = img_to_array(img) / 255.0
         return img_array
     for path in paths:
+        # np.expand_dims adds the batch dimension (1, 224, 224, 3)
         yield np.expand_dims(preprocess(path), axis=0)
 
 def calculate_recall_at_k(embedding_model, test_paths, test_labels, k):
-    """
-    Measures the model's ability to retrieve images of the same class (relevant items).
-    """
-    num_samples = len(test_labels)
-    embedding_dim = 128
-    test_embeddings = np.random.rand(num_samples, embedding_dim)
-    nn_model = NearestNeighbors(n_neighbors=k + 1, metric='cosine')
+    """Measures the model's ability to retrieve images of the same class (Recall@K)."""
+    print("\nGenerating real test embeddings with the trained model...")
+    test_gen = get_simple_image_generator(test_paths, TARGET_SHAPE)
+    test_embeddings = embedding_model.predict(
+        test_gen,
+        steps=len(test_paths),
+        verbose=1
+    )
+    nn_model = NearestNeighbors(n_neighbors=k + 1, metric='cosine') 
     nn_model.fit(test_embeddings)
     distances, indices = nn_model.kneighbors(test_embeddings, return_distance=False)
+    num_samples = len(test_labels)
     hit_count = 0
     for i in range(num_samples):
+        # neighbor_indices excludes the first element (index 0), which is the query image itself
         neighbor_indices = indices[i, 1:]
+        # Get the true labels for the retrieved neighbors
         retrieved_labels = test_labels[neighbor_indices]
+        # Check if ANY of the retrieved labels match the query image's label (test_labels[i])
         if np.any(retrieved_labels == test_labels[i]):
             hit_count += 1
     recall_at_k = hit_count / num_samples
