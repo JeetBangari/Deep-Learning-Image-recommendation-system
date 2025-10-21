@@ -59,3 +59,43 @@ print("1. Defining Embedding Network...")
 embedding_nn = get_embedding_network()
 print("2. Defining Triplet Training Model...")
 triplet_train_model = get_triplet_model(embedding_nn)
+K_NEIGHBORS = 5
+MODEL_PATH = 'final_image_embedding_nn.h5'
+
+def index_test_data(base_dir):
+    """
+    Creates a list of all file paths and a list of their corresponding class labels.
+    This is necessary to check if a retrieved neighbor is 'correct'.
+    """
+    all_paths = []
+    all_labels = []
+    # Map class names to integer IDs (0, 1, 2, ...) for easy comparison
+    class_to_id = {name: i for i, name in enumerate(os.listdir(base_dir))}
+    for class_name, class_id in class_to_id.items():
+        class_path = os.path.join(base_dir, class_name)
+        if os.path.isdir(class_path):
+            for img_file in os.listdir(class_path):
+                if img_file.endswith(('.jpg', '.jpeg', '.png')):
+                    all_paths.append(os.path.join(class_path, img_file))
+                    all_labels.append(class_id)
+                    
+    return all_paths, np.array(all_labels)
+
+def calculate_recall_at_k(embedding_model, test_paths, test_labels, k):
+    """
+    Measures the model's ability to retrieve images of the same class (relevant items).
+    """
+    num_samples = len(test_labels)
+    embedding_dim = 128
+    test_embeddings = np.random.rand(num_samples, embedding_dim)
+    nn_model = NearestNeighbors(n_neighbors=k + 1, metric='cosine')
+    nn_model.fit(test_embeddings)
+    distances, indices = nn_model.kneighbors(test_embeddings, return_distance=False)
+    hit_count = 0
+    for i in range(num_samples):
+        neighbor_indices = indices[i, 1:]
+        retrieved_labels = test_labels[neighbor_indices]
+        if np.any(retrieved_labels == test_labels[i]):
+            hit_count += 1
+    recall_at_k = hit_count / num_samples
+    return recall_at_k
