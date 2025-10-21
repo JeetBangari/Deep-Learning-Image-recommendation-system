@@ -1,0 +1,54 @@
+BASE_VAL_DIR = "C:\ImageDataSet\OIDv4_ToolKit\OID\Dataset\validation"
+BASE_TEST_DIR = "C:\ImageDataSet\OIDv4_ToolKit\OID\Dataset\test"
+train_triplets = create_triplet_list(BASE_TRAIN_DIR, num_triplets=700)
+val_triplets = create_triplet_list(BASE_VAL_DIR, num_triplets=150)
+test_triplets = create_triplet_list(BASE_TEST_DIR, num_triplets=150)
+train_generator = TripletGenerator(train_triplets, batch_size=32, shuffle=True)
+val_generator = TripletGenerator(val_triplets, batch_size=32, shuffle=False)
+test_generator = TripletGenerator(test_triplets, batch_size=32, shuffle=False)
+# 1. Model Checkpoint: Saves the best weights (based on validation loss)
+checkpoint_filepath = 'triplet_model_best_weights.h5'
+model_checkpoint_callback = ModelCheckpoint(
+    filepath=checkpoint_filepath,
+    save_weights_only=True, # Save only the weights of the model
+    monitor='val_loss',     # Track the validation loss
+    mode='min',             # Save when validation loss is MINIMUM
+    save_best_only=True,    # Only overwrite if the new loss is better
+    verbose=1
+)
+# 2. Early Stopping: Stops training if the validation loss plateaus
+early_stopping_callback = EarlyStopping(
+    monitor='val_loss',     # Track the validation loss
+    patience=5,             # Number of epochs to wait before stopping (e.g., 5)
+    mode='min',
+    restore_best_weights=True, # Restore weights from the epoch with the lowest val_loss
+    verbose=1
+)
+CALLBACKS = [model_checkpoint_callback, early_stopping_callback]
+triplet_train_model.compile(optimizer='adam', loss=triplet_loss)
+print("\nStarting Triplet Loss Training...")
+history = triplet_train_model.fit(
+    train_generator,
+    epochs=50, # Set a high number, but Early Stopping will halt it
+    validation_data=val_generator, # Pass the validation generator here
+    callbacks=CALLBACKS,           # Use the defined callbacks
+    verbose=1
+)
+print("Training complete! Best weights saved.")
+print("3. Compiling Model with Triplet Loss...")
+triplet_train_model.compile(
+    optimizer='adam',
+    loss=triplet_loss
+)
+triplet_train_model.summary()
+# 1. Load the best weights into the single embedding network
+embedding_nn.load_weights(checkpoint_filepath)
+# 2. Generate embeddings for the entire Test Set (the truly unseen data)
+test_embeddings = embedding_nn.predict(test_generator, verbose=1)
+# 3. Create the K-NN Search Index
+# Fit K-NN on the test embeddings using Cosine Similarity
+nn_model = NearestNeighbors(n_neighbors=5, metric='cosine')
+nn_model.fit(test_embeddings)
+# Save the feature extraction model in the Keras format
+embedding_nn.save('final_image_embedding_nn.h5')
+print("Final embedding model saved for deployment.")
