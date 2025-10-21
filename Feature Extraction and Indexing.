@@ -1,0 +1,74 @@
+import pickel
+def index_all_data(base_dirs):
+    """
+    Creates a single master list of all image paths and labels across all splits.
+    Args:
+        base_dirs (list): A list of paths for the Train, Validation, and Test root folders.
+    Returns:
+        tuple: (list of all absolute file paths, array of all corresponding integer labels)
+    """
+    all_paths = []
+    all_labels = []
+    # Use a dictionary to map class names consistently across all folders
+    all_class_names = []
+    for base_dir in base_dirs:
+        class_names_in_dir = [name for name in os.listdir(base_dir) if os.path.isdir(os.path.join(base_dir, name))]
+        all_class_names.extend(class_names_in_dir)
+    unique_class_names = sorted(list(set(all_class_names)))
+    class_to_id = {name: i for i, name in enumerate(unique_class_names)}
+    for base_dir in base_dirs:
+        for class_name in os.listdir(base_dir):
+            class_path = os.path.join(base_dir, class_name)
+            if os.path.isdir(class_path) and class_name in class_to_id:
+                class_id = class_to_id[class_name]
+                for img_file in os.listdir(class_path):
+                    if img_file.endswith(('.jpg', '.jpeg', '.png')):
+                        all_paths.append(os.path.join(class_path, img_file))
+                        all_labels.append(class_id)
+    print(f"Total Images Indexed: {len(all_paths)}")
+    return all_paths, np.array(all_labels)
+
+def generate_and_save_embeddings(embedding_model, all_paths, img_size):
+    """
+    Feeds all images through the trained CNN to get feature vectors.
+    Args:
+        embedding_model (Model): The trained single-input feature extraction model.
+        all_paths (list): The master list of all image paths.
+        img_size (tuple): The target size (224, 224).
+    Returns:
+        numpy.ndarray: The array of all generated embeddings.
+    """
+    print("\nStarting feature extraction for all images...")
+    # 1. Create the generator for ALL images
+    full_data_generator = get_simple_image_generator(all_paths, img_size)
+    # 2. Run prediction
+    image_embeddings = embedding_model.predict(
+        full_data_generator,
+        steps=len(all_paths),
+        verbose=1
+    )
+    
+    print(f"Feature Database created with shape: {image_embeddings.shape}")
+    # 3. Save the embeddings (the raw database) and paths map for easy loading in the demo
+    np.save('master_image_embeddings.npy', image_embeddings)
+    np.save('master_image_paths.npy', np.array(all_paths))
+    return image_embeddings
+
+def create_and_save_index(image_embeddings):
+    """
+    Fits the K-NN model to the embeddings and saves the searchable index.
+    Args:
+        image_embeddings (numpy.ndarray): The array of feature vectors.
+    """
+    # Using cosine similarity as the distance metric
+    nn_model = NearestNeighbors(n_neighbors=K_NEIGHBORS + 1, metric='cosine') 
+    # 2. Fit the model (Builds the searchable index structure)
+    nn_model.fit(image_embeddings)
+    # 3. Save the K-NN model using pickle (standard for saving scikit-learn models)
+    try:
+        with open('final_nn_index.pkl', 'wb') as f:
+            pickle.dump(nn_model, f)
+        print("K-NN Search Index saved to 'final_nn_index.pkl'")
+        
+    except Exception as e:
+        print(f"ERROR: Could not save K-NN index: {e}")
