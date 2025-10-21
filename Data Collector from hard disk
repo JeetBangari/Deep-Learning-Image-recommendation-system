@@ -1,0 +1,46 @@
+import os
+import numpy as np
+import random
+
+BASE_TRAIN_DIR = "C:\ImageDataSet\OIDv4_ToolKit\OID\Dataset\train"
+
+def create_triplet_list(base_dir, num_triplets):
+    all_classes = {}
+    
+    # 1. Index all image paths by class
+    for class_name in os.listdir(base_dir):
+        class_path = os.path.join(base_dir, class_name)
+        if os.path.isdir(class_path):
+            all_classes[class_name] = [
+                os.path.join(class_path, img) for img in os.listdir(class_path)
+            ]
+
+    triplets = []
+    class_names = list(all_classes.keys())
+
+    # 2. Generate the required number of triplets
+    for _ in range(num_triplets):
+        # A & P: Anchor and Positive are from the same class
+        anchor_class = random.choice(class_names)
+        
+        # Ensure there are at least two images in the class for A and P
+        if len(all_classes[anchor_class]) < 2:
+            continue
+
+        # Choose A and P paths (must be distinct indices)
+        anchor_path, positive_path = random.sample(all_classes[anchor_class], 2)
+
+        # N: Negative is from a different class
+        negative_class = random.choice([c for c in class_names if c != anchor_class])
+        
+        # Choose N path
+        negative_path = random.choice(all_classes[negative_class])
+        
+        triplets.append((anchor_path, positive_path, negative_path))
+        
+    return triplets
+
+#Triplet Generator class then after the class following lines:-
+
+triplet_paths = create_triplet_list(BASE_TRAIN_DIR, num_triplets=700)
+train_generator = TripletGenerator(triplet_list=triplet_paths,batch_size=32,img_size=(224, 224))
