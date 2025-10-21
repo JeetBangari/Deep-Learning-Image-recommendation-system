@@ -1,0 +1,57 @@
+import os
+import numpy as np
+import random
+import tensorflow as tf
+from tensorflow.keras.applications import ResNet50
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Dense, GlobalAveragePooling2D, Lambda
+from tensorflow.keras.utils import Sequence
+from tensorflow.keras.preprocessing.image import load_img, img_to_array
+def triplet_loss(y_true, y_pred, margin=TRIPLET_MARGIN):
+    """
+    Calculates the Triplet Loss: L = max(0, d(A,P) - d(A,N) + margin)
+    Note: y_pred contains the concatenated embeddings [E_A, E_P, E_N]
+    """
+    # 1. Split the concatenated embeddings
+    # Assume the concatenated embeddings are [Anchor, Positive, Negative]
+    anchor, positive, negative = tf.split(y_pred, num_or_size_splits=3, axis=1)
+    # 2. Calculate distances (Squared Euclidean distance is simplest for Keras)
+    pos_dist = tf.reduce_sum(tf.square(anchor - positive), axis=1)
+    neg_dist = tf.reduce_sum(tf.square(anchor - negative), axis=1)
+    # 3. Calculate the loss: max(0, pos_dist - neg_dist + margin)
+    loss = tf.maximum(pos_dist - neg_dist + margin, 0.0)
+    # Return the mean loss across the batch
+    return tf.reduce_mean(loss)
+
+# Define the single Embedding Network (Backbone + Head)
+def get_embedding_network(input_shape=TARGET_SHAPE + (3,)):
+    # Load ResNet50 pre-trained on ImageNet
+    base_model = ResNet50(weights='imagenet', include_top=False, input_shape=input_shape)
+    # --- Freezing Strategy ---
+    # Freeze the weights of the base CNN to preserve ImageNet features
+    base_model.trainable = False
+    # --- Adding the Embedding Head (The layers that will be trained) ---
+    x = base_model.output
+    x = GlobalAveragePooling2D()(x) # Reduces spatial dimensions
+    # The final dense embedding layer
+    x = Dense(EMBEDDING_DIM)(x)
+    # L2 Normalization (Crucial for similarity metric learning)
+    output = Lambda(lambda x: tf.math.l2_normalize(x, axis=1), name="embedding")(x)
+    return Model(inputs=base_model.input, outputs=output)
+
+# Define the full Siamese-like Triplet Model
+def get_triplet_model(embedding_model):
+    # 1. Define the three inputs
+    anchor_input = Input(shape=TARGET_SHAPE + (3,), name="anchor_input")
+    positive_input = Input(shape=TARGET_SHAPE + (3,), name="positive_input")
+    negative_input = Input(shape=TARGET_SHAPE + (3,), name="negative_input")
+    # 2. Process each input using the SAME weight-sharing embedding model
+    anchor_embedding = embedding_model(anchor_input)
+    positive_embedding = embedding_model(positive_input)
+    negative_embedding = embedding_model(negative_input)
+    # 3. Concatenate the three outputs for loss calculation
+    concatenated_output = tf.concat([anchor_embedding, positive_embedding, negative_embedding], axis=1)
+    # The Triplet model receives three inputs and outputs the concatenated embeddings
+    # The loss function will interpret this concatenated vector.
+    triplet_model = Model(inputs=[anchor_input, positive_input, negative_input],outputs=concatenated_output)
+    return
